@@ -5,7 +5,6 @@ from oic.oic import Client
 from oic.oic.message import OpenIDSchema
 from oic.oic.message import RegistrationResponse
 from oic.utils.authn.client import CLIENT_AUTHN_METHOD
-from oic.utils.settings import ClientSettings
 from pas.plugins.oidc import logger
 from plone.base.utils import safe_text
 from plone.protect.utils import safeWrite
@@ -69,6 +68,29 @@ class OAuth2ConnectionException(Exception):
 
 class IOIDCPlugin(Interface):
     """ """
+
+
+class OAMClient(Client):
+    """Override so we can adjust the jwks_uri to add domain needed for OAM"""
+
+    def __init__(self, *args, domain=None, **xargs):
+        super().__init__(self, *args, **xargs)
+        self.domain = domain
+        if domain:
+            session = requests.Session()
+            session.headers.update({"x-oauth-identity-domain-name": domain})
+            self.settings.requests_session = session
+
+    def handle_provider_config(self, pcr, issuer, keys=True, endpoints=True):
+        domain = self.domain
+        if domain:
+            # we need to modify jwks_uri in the provider_info to add the identityDomain for OAM
+            # gets used in https://github.com/CZ-NIC/pyoidc/blob/0bd1eadcefc5ccb7ef6c69d9b631537a7d3cfe30/src/oic/oauth2/__init__.py#L1132
+            url = pcr["jwks_uri"]
+            req = requests.PreparedRequest()
+            req.prepare_url(url, dict(identityDomainName=domain))
+            pcr["jwks_uri"] = req.url
+        return super().handle_provider_config(pcr, issuer, keys, endpoints)
 
 
 @implementer(IOIDCPlugin)
@@ -167,7 +189,7 @@ class OIDCPlugin(BasePlugin):
             id="identity_domain_name",
             type="string",
             mode="w",
-            label="Required for Oracle Authentication Manager",
+            label="Identity Domain Name (required for Oracle Authentication Manager only)",
         ),
     )
 
@@ -341,15 +363,14 @@ class OIDCPlugin(BasePlugin):
     # TODO: memoize (?)
     def get_oauth2_client(self):
         domain = self.getProperty("identity_domain_name")
-        if domain:
-            settings = ClientSettings()
-            session = requests.Session()
-            session.headers.update({"x-oauth-identity-domain-name": domain})
-            settings.requests_session = session
-        else:
-            settings = None
         try:
-            client = Client(client_authn_method=CLIENT_AUTHN_METHOD, settings=settings)
+            if domain:
+                client = OAMClient(
+                    client_authn_method=CLIENT_AUTHN_METHOD,
+                    domain=domain,
+                )
+            else:
+                client = Client(client_authn_method=CLIENT_AUTHN_METHOD)
             client.allow["issuer_mismatch"] = (
                 True  # Some providers aren't configured with configured and issuer urls the same even though they should.
             )
@@ -360,18 +381,6 @@ class OIDCPlugin(BasePlugin):
 
             # use WebFinger
             provider_info = client.provider_config(self.getProperty("issuer"))  # noqa
-            if domain:
-                # TODO: we need to modify jwks_uri in the provider_info to add the identityDomain for OAM
-                # gets used in https://github.com/CZ-NIC/pyoidc/blob/0bd1eadcefc5ccb7ef6c69d9b631537a7d3cfe30/src/oic/oauth2/__init__.py#L1132
-                # we could
-                # - override client.handle_provider_info to change jwks_uri. - https://github.com/CZ-NIC/pyoidc/blob/0bd1eadcefc5ccb7ef6c69d9b631537a7d3cfe30/src/oic/oauth2/__init__.py#L1055
-                # - monkey patch KeyBundle and modify source - https://github.com/CZ-NIC/pyoidc/blob/master/src/oic/utils/keyio.py#L66
-                # - modify the keybundle objects after provider_config but before they are used.
-                #   - client.keyjar.issuer_keys[issuer].source = ...
-                for key in client.keyjar.issuer_keys[self.getProperty("issuer")]:
-                    req = requests.PreparedRequest()
-                    req.prepare_url(key.source, dict(identityDomainName=domain))
-                    key.source = req.url
             info = {
                 "client_id": self.getProperty("client_id"),
                 "client_secret": self.getProperty("client_secret"),
